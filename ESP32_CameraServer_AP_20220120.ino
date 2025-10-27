@@ -18,6 +18,68 @@ CameraWebServer_AP CameraWebServerAP;
 
 bool WA_en = false;
 
+// Globals
+unsigned long nextIdCounter = 1;
+
+// Make an H string like "m001" or "t012"
+String makeId(const char prefix) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%c%03lu", prefix, nextIdCounter++);
+  return String(buf);
+}
+
+// Wait for an ack of form {<id>_ok} up to timeoutMs.
+// Returns true if ack received, false on timeout or errored response.
+bool waitForAck(const String &id, unsigned long timeoutMs = 1000) {
+  unsigned long start = millis();
+  String frame = "";
+  bool inFrame = false;
+  while (millis() - start < timeoutMs) {
+    while (Serial2.available()) {
+      char c = Serial2.read();
+      if (c == '{') { inFrame = true; frame = ""; continue; }
+      if (!inFrame) continue;
+      if (c == '}') {
+        inFrame = false;
+        // frame contains content like m001_ok or "err":"overflow" etc.
+        if (frame == (id + "_ok")) return true;
+        if (frame.indexOf("\"err\"") >= 0) return false;
+        // else continue waiting
+      } else {
+        frame += c;
+      }
+    }
+    delay(5);
+  }
+  return false;
+}
+
+// Send a move (meters as float) and optionally wait for ack.
+bool sendMoveMeters(float meters, bool waitAck = true) {
+  uint16_t cm = (uint16_t)round(meters * 100.0f); // convert to cm
+  String id = makeId('m');
+  // Build JSON frame manually (no spaces)
+  Serial2.print("{\"N\":200,\"D1\":1,\"D2\":");
+  Serial2.print(cm);
+  Serial2.print(",\"H\":\"");
+  Serial2.print(id);
+  Serial2.print("\"}");
+  if (waitAck) return waitForAck(id, 1000);
+  return true;
+}
+
+// Send a turn (degrees) and optionally wait for ack.
+bool sendTurnDegrees(int degrees, bool waitAck = true) {
+  String id = makeId('t');
+  Serial2.print("{\"N\":201,\"D1\":");
+  Serial2.print(degrees);
+  Serial2.print(",\"H\":\"");
+  Serial2.print(id);
+  Serial2.print("\"}");
+  if (waitAck) return waitForAck(id, 1000);
+  return true;
+}
+
 void SocketServer_Test(void)
 {
   static bool ED_client = true;

@@ -17,6 +17,8 @@
 #include "img_converters.h"
 #include "camera_index.h"
 #include "Arduino.h"
+// JSON parsing
+#include <ArduinoJson.h>
 
 #include "fb_gfx.h"
 #include "fd_forward.h"
@@ -921,6 +923,235 @@ static esp_err_t Test2_handler(httpd_req_t *req)
     httpd_resp_send(req, (const char *)"index", 5);
     return ESP_OK;
 }
+
+// Helper: send a frame string over Serial2 and wait for Arduino ack of form {<id>_ok}
+static bool sendFrameAndWaitAck(const String &frame, const String &id, uint32_t timeoutMs = 800)
+{
+    // send frame
+    Serial2.print(frame);
+    unsigned long start = millis();
+    String buf = "";
+    bool inFrame = false;
+    while (millis() - start < timeoutMs)
+    {
+        while (Serial2.available())
+        {
+            char c = Serial2.read();
+            if (c == '{')
+            {
+                inFrame = true;
+                buf = "";
+                continue;
+            }
+            if (!inFrame)
+                continue;
+            if (c == '}')
+            {
+                inFrame = false;
+                // buf contains content e.g. m001_ok or {"err":"overflow"} inner
+                if (buf == (id + "_ok"))
+                    return true;
+                if (buf.indexOf("\"err\"") >= 0)
+                    return false;
+            }
+            else
+            {
+                buf += c;
+            }
+        }
+        delay(5);
+    }
+    return false; // timeout
+}
+
+// Helper: send a frame over Serial2 and wait for a JSON object response (returns true + fills outJson)
+static bool sendFrameAndWaitJsonResponse(const String &frame, String &outJson, uint32_t timeoutMs = 800)
+{
+    // send frame
+    Serial2.print(frame);
+    unsigned long start = millis();
+    String buf = "";
+    bool inFrame = false;
+    while (millis() - start < timeoutMs)
+    {
+        while (Serial2.available())
+        {
+            char c = Serial2.read();
+            if (c == '{')
+            {
+                inFrame = true;
+                buf = "";
+                buf += c;
+                continue;
+            }
+            if (!inFrame)
+                continue;
+            buf += c;
+            if (c == '}')
+            {
+                inFrame = false;
+                // buf contains a full JSON object (including outer braces)
+                outJson = buf;
+                return true;
+            }
+        }
+        delay(5);
+    }
+    return false; // timeout
+}
+
+// POST /api/path
+// Accepts single action {"cmd":"move","d":5.0,"dir":1,"id":"m001"} or {"cmd":"turn","a":90,"id":"t001"}
+// or an array of such objects. Converts to Arduino protocol and forwards per-action.
+static esp_err_t path_post_handler(httpd_req_t *req)
+{
+    size_t content_len = req->content_len;
+    if (content_len == 0 || content_len > 4096)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_FAIL;
+    }
+
+    char *body = (char *)malloc(content_len + 1);
+    if (!body)
+    {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    size_t received = 0;
+    while (received < content_len)
+    {
+        int ret = httpd_req_recv(req, body + received, content_len - received);
+        if (ret <= 0)
+        {
+            free(body);
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        received += ret;
+    }
+    body[content_len] = '\0';
+
+    // Parse JSON
+    DynamicJsonDocument doc(4096);
+    DeserializationError err = deserializeJson(doc, body);
+    free(body);
+    if (err)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+        return ESP_FAIL;
+    }
+
+    // Prepare response JSON
+    DynamicJsonDocument resp(1024);
+    JsonArray acks = resp.createNestedArray("acks");
+
+    // Helper to process a single action object
+    auto processAction = [&](JsonObject action) {
+        const char *cmd = action["cmd"] | "";
+        String id = action["id"] | "";
+        String frame;
+        if (strcmp(cmd, "move") == 0)
+        {
+            float meters = action["d"] | 0.0f;
+            int dir = action["dir"] | 1;
+            uint32_t cm = (uint32_t)round(meters * 100.0f);
+            if (id.length() == 0)
+            {
+                id = String("m") + String(random(1, 10000));
+            }
+            frame = String("{\"N\":200,\"D1\":") + String(dir) + String(",\"D2\":") + String(cm) + String(",\"H\":\"") + id + String("\"}");
+        }
+        else if (strcmp(cmd, "turn") == 0)
+        {
+            int angle = action["a"] | 0;
+            if (id.length() == 0)
+            {
+                id = String("t") + String(random(1, 10000));
+            }
+            frame = String("{\"N\":201,\"D1\":") + String(angle) + String(",\"H\":\"") + id + String("\"}");
+        }
+        else
+        {
+            return; // ignore unknown
+        }
+
+        bool ok = sendFrameAndWaitAck(frame, id, 1000);
+        if (ok)
+            acks.add(id + String("_ok"));
+        else
+            acks.add(String("{\"id\":\"") + id + String("\",\"status\":\"fail\"}"));
+    };
+
+    if (doc.is<JsonArray>())
+    {
+        for (JsonObject item : doc.as<JsonArray>())
+            processAction(item);
+    }
+    else if (doc.is<JsonObject>())
+    {
+        processAction(doc.as<JsonObject>());
+    }
+    else
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad payload");
+        return ESP_FAIL;
+    }
+
+    String out;
+    serializeJson(resp, out);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, out.c_str(), out.length());
+    return ESP_OK;
+}
+
+// GET /api/pose
+// Query the Arduino for current estimated pose via N=300. Returns the Arduino JSON directly.
+static esp_err_t pose_get_handler(httpd_req_t *req)
+{
+    // construct a random id so Arduino will echo it in H
+    String id = String("p") + String(random(1000, 9999));
+    String frame = String("{\"N\":300,\"H\":\"") + id + String("\"}");
+    String respJson;
+    bool ok = sendFrameAndWaitJsonResponse(frame, respJson, 800);
+    if (!ok)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no response");
+        return ESP_FAIL;
+    }
+    // respJson contains the Arduino response JSON (e.g. {"H":"p1234","pose":{"x":...,"v":...}})
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, respJson.c_str(), respJson.length());
+    return ESP_OK;
+}
+
+// Simple web UI served at /ui — tiny page to send path actions and show pose
+static esp_err_t ui_get_handler(httpd_req_t *req)
+{
+    const char *html = "<!doctype html>\n"
+                       "<html><head><meta charset=\"utf-8\"><title>Robot Path UI</title></head>\n"
+                       "<body>\n"
+                       "<h3>Robot Path UI</h3>\n"
+                       "<div>Move (meters): <input id=\"moveMeters\" value=\"0.5\"> dir: <select id=\"dir\"><option value=\"1\">forward</option><option value=\"2\">backward</option></select> <button onclick=\"sendMove()\">Send Move</button></div>\n"
+                       "<div>Turn (deg): <input id=\"turnDeg\" value=\"90\"> <button onclick=\"sendTurn()\">Send Turn</button></div>\n"
+                       "<div><button onclick=\"sendSamplePath()\">Send Sample Path</button></div>\n"
+                       "<pre id=\"log\" style=\"height:200px;overflow:auto;border:1px solid #ccc\"></pre>\n"
+                       "<h4>Pose</h4><pre id=\"pose\">-</pre>\n"
+                       "<script>\n"
+                       "function log(s){document.getElementById('log').textContent += s + '\n';} \n"
+                       "function sendMove(){let m=document.getElementById('moveMeters').value;let dir=document.getElementById('dir').value;fetch('/api/path',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:'move',d:parseFloat(m),dir:parseInt(dir)})}).then(r=>r.json()).then(j=>log(JSON.stringify(j)));}\n"
+                       "function sendTurn(){let a=document.getElementById('turnDeg').value;fetch('/api/path',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:'turn',a:parseInt(a)})}).then(r=>r.json()).then(j=>log(JSON.stringify(j)));}\n"
+                       "function sendSamplePath(){let arr=[{cmd:'move',d:0.5,dir:1,id:'m1'},{cmd:'turn',a:90,id:'t1'},{cmd:'move',d:0.2,dir:1,id:'m2'}];fetch('/api/path',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(arr)}).then(r=>r.json()).then(j=>log(JSON.stringify(j)));}\n"
+                       "function pollPose(){fetch('/api/pose').then(r=>r.json()).then(j=>{document.getElementById('pose').textContent = JSON.stringify(j);}).catch(e=>{});} setInterval(pollPose,500);\n"
+                       "</script>\n"
+                       "</body></html>";
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, html, strlen(html));
+    return ESP_OK;
+}
 void startCameraServer()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -974,6 +1205,24 @@ void startCameraServer()
         .handler = Test2_handler,
         .user_ctx = NULL};
 
+    httpd_uri_t path_uri = {
+        .uri = "/api/path",
+        .method = HTTP_POST,
+        .handler = path_post_handler,
+        .user_ctx = NULL};
+
+    httpd_uri_t pose_uri = {
+        .uri = "/api/pose",
+        .method = HTTP_GET,
+        .handler = pose_get_handler,
+        .user_ctx = NULL};
+
+    httpd_uri_t ui_uri = {
+        .uri = "/ui",
+        .method = HTTP_GET,
+        .handler = ui_get_handler,
+        .user_ctx = NULL};
+
     ra_filter_init(&ra_filter, 20);
 
     mtmn_config.type = FAST;
@@ -1001,6 +1250,9 @@ void startCameraServer()
         httpd_register_uri_handler(camera_httpd, &Test_uri);
         httpd_register_uri_handler(camera_httpd, &Test1_uri);
         httpd_register_uri_handler(camera_httpd, &Test2_uri);
+        httpd_register_uri_handler(camera_httpd, &path_uri);
+        httpd_register_uri_handler(camera_httpd, &pose_uri);
+        httpd_register_uri_handler(camera_httpd, &ui_uri);
     }
     config.server_port += 1; //视频流端口
     config.ctrl_port += 1;
