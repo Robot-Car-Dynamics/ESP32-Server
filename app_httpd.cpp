@@ -725,6 +725,8 @@ static esp_err_t path_post_handler(httpd_req_t *req)
     free(body);
     if (err)
     {
+          Serial.print(F("deserializeJson() failed: "));
+    Serial.println(err.c_str());
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
         return ESP_FAIL;
     }
@@ -842,6 +844,7 @@ static esp_err_t ui_get_handler(httpd_req_t *req)
 void startCameraServer()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 16;
 
     httpd_uri_t index_uri = {
         .uri = "/",

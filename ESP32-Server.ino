@@ -12,8 +12,8 @@
 #include "esp_camera.h"
 WiFiServer server(100);
 
-#define RXD2 33
-#define TXD2 4
+#define RXD2 3
+#define TXD2 40
 CameraWebServer_AP CameraWebServerAP;
 
 bool WA_en = false;
@@ -212,7 +212,7 @@ void FactoryTest(void)
     {
       if (true == WA_en)
       {
-        digitalWrite(13, LOW);
+        digitalWrite(46, LOW);
         Serial2.print("{WA_OK}");
         WA_en = false;
       }
@@ -232,12 +232,12 @@ void FactoryTest(void)
         if (en == true)
         {
           en = false;
-          digitalWrite(13, HIGH);
+          digitalWrite(46, HIGH);
         }
         else
         {
           en = true;
-          digitalWrite(13, LOW);
+          digitalWrite(46, LOW);
         }
         Test_time = millis();
       }
@@ -246,13 +246,15 @@ void FactoryTest(void)
 }
 void setup()
 {
-  Serial.begin(9600);
+  Serial.begin(115200);
+  Serial.print("wifi_name:");
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
   //http://192.168.4.1/control?var=framesize&val=3
   //http://192.168.4.1/Test?var=
   CameraWebServerAP.CameraWebServer_AP_Init();
   server.begin();
   delay(100);
+  
   // while (Serial.read() >= 0)
   // {
   //   /*清空串口缓存...*/
@@ -261,10 +263,12 @@ void setup()
   // {
   //   /*清空串口缓存...*/
   // }
-  pinMode(13, OUTPUT);
-  digitalWrite(13, HIGH);
+  pinMode(46, OUTPUT);
+  digitalWrite(46, HIGH);
   Serial.println("Elegoo-2020...");
   Serial2.print("{Factory}");
+  //ESP.restart();
+  // esp_restart();
 }
 void loop()
 {
