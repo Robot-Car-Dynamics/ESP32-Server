@@ -614,79 +614,60 @@ static esp_err_t Test2_handler(httpd_req_t *req)
 // Helper: send a frame string over Serial2 and wait for Arduino ack of form {<id>_ok}
 static bool sendFrameAndWaitAck(const String &frame, const String &id, uint32_t timeoutMs = 800)
 {
+    
     // send frame
     Serial2.print(frame);
+    Serial.print("sent command for queueing ");
+    Serial.println(frame);
     unsigned long start = millis();
     String buf = "";
-    bool inFrame = false;
+delay(500);
     while (millis() - start < timeoutMs)
     {
         while (Serial2.available())
         {
-            char c = Serial2.read();
-            if (c == '{')
-            {
-                inFrame = true;
-                buf = "";
-                continue;
-            }
-            if (!inFrame)
-                continue;
-            if (c == '}')
-            {
-                inFrame = false;
-                // buf contains content e.g. m001_ok or {"err":"overflow"} inner
-                if (buf == (id + "_ok"))
-                    return true;
-                if (buf.indexOf("\"err\"") >= 0)
-                    return false;
-            }
-            else
-            {
-                buf += c;
-            }
-        }
-        delay(5);
-    }
-    return false; // timeout
-}
-
-// Helper: send a frame over Serial2 and wait for a JSON object response (returns true + fills outJson)
-static bool sendFrameAndWaitJsonResponse(const String &frame, String &outJson, uint32_t timeoutMs = 800)
-{
-    // send frame
-    Serial2.print(frame);
-    unsigned long start = millis();
-    String buf = "";
-    bool inFrame = false;
-    while (millis() - start < timeoutMs)
-    {
-        while (Serial2.available())
-        {
-            char c = Serial2.read();
-            if (c == '{')
-            {
-                inFrame = true;
-                buf = "";
-                buf += c;
-                continue;
-            }
-            if (!inFrame)
-                continue;
-            buf += c;
-            if (c == '}')
-            {
-                inFrame = false;
-                // buf contains a full JSON object (including outer braces)
-                outJson = buf;
+            buf = Serial2.readString();
+            Serial.print("Received: ");
+            Serial.println(buf);
+            if(buf.length() > 0){
                 return true;
             }
         }
         delay(5);
     }
+    Serial.print("timed out");
     return false; // timeout
 }
-
+// Helper: send a frame over Serial2 and wait for a JSON object response (returns true + fills outJson)
+static bool sendFrameAndWaitJsonResponse(const String &frame, String &outJson, uint32_t timeoutMs = 3000)
+{
+ 
+    // send frame
+    Serial2.print(frame);
+    Serial.print("Sent frame: ");
+    Serial.println(frame);
+    
+    unsigned long start = millis();
+    String buf = "";
+    delay(500);
+    bool ok = Serial2.available();
+    Serial.print(ok);
+    while (millis() - start < timeoutMs)
+    {
+        while (Serial2.available())
+        {
+        outJson = Serial2.readString();
+        if(outJson.length()>0){
+            return true;
+        }
+    }
+}
+// Serial.print("\nTimeout! Received ");
+// Serial.print(frame_from_arduino.length());
+// Serial.println(" chars total");
+// Serial.println(frame_from_arduino);
+return false; // timeout
+}
 // POST /api/path
 // Accepts single action {"cmd":"move","d":5.0,"dir":1,"id":"m001"} or {"cmd":"turn","a":90,"id":"t001"}
 // or an array of such objects. Converts to Arduino protocol and forwards per-action.
@@ -765,7 +746,7 @@ static esp_err_t path_post_handler(httpd_req_t *req)
             return; // ignore unknown
         }
 
-        bool ok = sendFrameAndWaitAck(frame, id, 1000);
+        bool ok = sendFrameAndWaitAck(frame, id, 3000);
         if (ok)
             acks.add(id + String("_ok"));
         else
@@ -803,7 +784,15 @@ static esp_err_t pose_get_handler(httpd_req_t *req)
     String id = String("p") + String(random(1000, 9999));
     String frame = String("{\"N\":300,\"H\":\"") + id + String("\"}");
     String respJson;
-    bool ok = sendFrameAndWaitJsonResponse(frame, respJson, 800);
+    Serial.println("\n=== Pose Query Start ===");
+    Serial.print("Sending: ");
+    Serial.println(frame);
+        
+    bool ok = sendFrameAndWaitJsonResponse(frame, respJson, 3000);
+    Serial.print("recieved ");
+    Serial.print(respJson);
+    Serial.println("=== Pose Query End ===\n");
+    
     if (!ok)
     {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no response");

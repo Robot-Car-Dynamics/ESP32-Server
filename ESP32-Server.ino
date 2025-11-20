@@ -33,24 +33,12 @@ String makeId(const char prefix) {
 bool waitForAck(const String &id, unsigned long timeoutMs = 1000) {
   unsigned long start = millis();
   String frame = "";
-  bool inFrame = false;
-  while (millis() - start < timeoutMs) {
-    while (Serial2.available()) {
-      char c = Serial2.read();
-      if (c == '{') { inFrame = true; frame = ""; continue; }
-      if (!inFrame) continue;
-      if (c == '}') {
-        inFrame = false;
-        // frame contains content like m001_ok or "err":"overflow" etc.
-        if (frame == (id + "_ok")) return true;
-        if (frame.indexOf("\"err\"") >= 0) return false;
-        // else continue waiting
-      } else {
-        frame += c;
-      }
+  if(Serial2.available()){
+    frame = Serial2.readString();
+    if (frame == ("{" + id + "_ok}")) {
+      return true;
     }
-    delay(5);
-  }
+  } 
   return false;
 }
 
